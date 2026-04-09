@@ -1,1 +1,2 @@
+*.pkl filter=lfs diff=lfs merge=lfs -text
 app/core/ml/models/speech_emotion_rf.pkl filter=lfs diff=lfs merge=lfs -text
