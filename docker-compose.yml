@@ -1,0 +1,44 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16
+    restart: always
+    environment:
+      POSTGRES_DB: english_bot
+      POSTGRES_USER: english_bot
+      POSTGRES_PASSWORD: english_bot
+      USE_LLM_QUESTIONS: 1
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      OLLAMA_MODEL: mistral
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+
+  bot:
+    build: .
+    restart: unless-stopped  # Автоматический перезапуск при ошибках
+    volumes:
+      - ./.env:/app/.env
+      - ./models:/app/models
+    environment:
+      OLLAMA_BASE_URL: "http://host.docker.internal:11434"
+    dns:
+      - 8.8.8.8  # Google DNS
+      - 1.1.1.1  # Cloudflare DNS
+    extra_hosts:
+      - "api.telegram.org:149.154.167.220"  # IP адрес Telegram API
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    depends_on:
+      - db
+    command: >
+      bash -c "
+      alembic upgrade head &&
+      python -m app.main
+      "
+
+volumes:
+  db_data:
