@@ -3,7 +3,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message, CallbackQuery
 from aiogram.types import BufferedInputFile  # <-- ВАЖНО
 
-from app.core.ml.emotion_analyzer import EmotionAnalyzer
 from app.core.ml.question_generator import QuestionGenerator
 from app.core.services import LessonService, LessonType, DifficultyRegressionService
 from app.db.session import async_session_maker
@@ -168,8 +167,7 @@ async def handle_answer(callback: CallbackQuery, state: FSMContext, user):
             return
 
         # Оцениваем эмоцию (пока заглушка, но не ломает логику)
-        emotion_analyzer = EmotionAnalyzer()
-        emotion_score = await emotion_analyzer.estimate_emotion_score()
+        emotion_score = 0.0
 
         # Фиксируем ответ пользователя
         is_correct, lesson = await service.answer_question(

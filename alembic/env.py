@@ -1,12 +1,20 @@
 import os
 import sys
 from logging.config import fileConfig
+from pathlib import Path
 
-from sqlalchemy import engine_from_config, pool
 from alembic import context
+from dotenv import load_dotenv
+from sqlalchemy import engine_from_config, pool
 
-# поднимаем путь к приложению
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+# Корень проекта
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Добавляем корень проекта в sys.path
+sys.path.append(str(BASE_DIR))
+
+# Загружаем .env из корня проекта
+load_dotenv(BASE_DIR / ".env")
 
 from app.db.base import Base  # noqa
 
@@ -49,7 +57,10 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata)
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+        )
 
         with context.begin_transaction():
             context.run_migrations()

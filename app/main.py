@@ -41,7 +41,6 @@ async def run_polling_with_retry(bot: Bot, dp: Dispatcher):
             logger.exception(f"Unexpected error during polling: {e}")
             await asyncio.sleep(5)
 
-
 async def main():
     settings = get_settings()
 

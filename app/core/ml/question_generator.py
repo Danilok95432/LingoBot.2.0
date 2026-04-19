@@ -8,6 +8,7 @@ import textwrap
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Sequence
+from app.config import get_settings
 
 import requests
 from loguru import logger
@@ -47,32 +48,138 @@ class GeneratedQuestion:
     difficulty: float = 0.5
 
 
+def max_tokens_for_batch(n: int) -> int:
+    return max(256, min(2048, 320 * n))
+
 class LLMQuestionBackend:
     """
-    Обёртка над Ollama Mistral.
+    Обёртка над LLM backend.
 
-    Настройки через env:
-    - OLLAMA_BASE_URL (по умолчанию http://ollama:11434)
-    - OLLAMA_MODEL (по умолчанию mistral)
+    Поддерживаемые провайдеры:
+    - deepseek
+    - ollama
     """
 
     def __init__(self) -> None:
-        self.base_url = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434").rstrip("/")
-        self.model_name = os.getenv("OLLAMA_MODEL", "mistral")
-        self.available = True  # считаем доступной, пока не упали с ошибкой
+        settings = get_settings()
 
-        logger.info("Используем Ollama LLM для вопросов: base_url={}, model={}", self.base_url, self.model_name)
+        self.provider = settings.llm_provider.strip().lower()
 
-    # ----------- низкоуровневый вызов Ollama -----------
+        self.deepseek_api_key = settings.deepseek_api_key
+        self.deepseek_base_url = settings.deepseek_base_url.rstrip("/")
+        self.deepseek_model = settings.deepseek_model
+
+        self.ollama_base_url = settings.ollama_base_url.rstrip("/")
+        self.ollama_model = settings.ollama_model
+
+        self.available = True
+
+        if self.provider == "deepseek":
+            if not self.deepseek_api_key:
+                logger.warning("DEEPSEEK_API_KEY не задан, DeepSeek backend будет отключён")
+                self.available = False
+            else:
+                logger.info(
+                    "Используем DeepSeek LLM для вопросов: base_url={}, model={}",
+                    self.deepseek_base_url,
+                    self.deepseek_model,
+                )
+        elif self.provider == "ollama":
+            logger.info(
+                "Используем Ollama LLM для вопросов: base_url={}, model={}",
+                self.ollama_base_url,
+                self.ollama_model,
+            )
+        else:
+            logger.warning("Неизвестный LLM_PROVIDER='{}', LLM backend будет отключён", self.provider)
+            self.available = False
 
     def _generate_raw(self, prompt: str, max_tokens: int = 512) -> str:
-        """
-        Вызов /api/generate у Ollama без стриминга.
-        Возвращаем просто text (data["response"]).
-        """
-        url = f"{self.base_url}/api/generate"
+        if self.provider == "deepseek":
+            return self._generate_raw_deepseek(prompt, max_tokens=max_tokens)
+        if self.provider == "ollama":
+            return self._generate_raw_ollama(prompt, max_tokens=max_tokens)
+
+        self.available = False
+        return ""
+
+    @staticmethod
+    def _normalize_text(value: str) -> str:
+        value = value.lower().strip()
+        value = re.sub(r"\s+", " ", value)
+        return value
+
+    @staticmethod
+    def _cleanup_stem(text: str) -> str:
+        # Убираем типичные подсказки модели в скобках:
+        # "(an interesting film)", "(work / works)", "(in May)"
+        text = re.sub(r"\s*\([^)]*\)", "", text)
+        text = re.sub(r"\s{2,}", " ", text).strip()
+        return text
+
+    @classmethod
+    def _question_leaks_answer(cls, text: str, options: list[str], correct_index: int) -> bool:
+        if not options:
+            return True
+
+        raw_text = text.strip()
+        norm_text = cls._normalize_text(raw_text)
+
+        # Если в тексте остались явные "подсказочные" конструкции — бракуем
+        if "(" in raw_text or ")" in raw_text:
+            return True
+        if " / " in raw_text:
+            return True
+
+        if 0 <= correct_index < len(options):
+            correct_option = cls._normalize_text(options[correct_index])
+            if correct_option and correct_option in norm_text:
+                return True
+
+        return False
+
+    def _generate_raw_deepseek(self, prompt: str, max_tokens: int = 512) -> str:
+        url = f"{self.deepseek_base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.deepseek_api_key}",
+            "Content-Type": "application/json",
+        }
         payload = {
-            "model": self.model_name,
+            "model": self.deepseek_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are an experienced ESL teacher. Return concise, valid outputs only.",
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+            "temperature": 0.7,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=120)
+            resp.raise_for_status()
+            data = resp.json()
+            text = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+            ) or ""
+            return text.strip()
+        except Exception as exc:
+            logger.error("Ошибка при обращении к DeepSeek: {}", exc)
+            self.available = False
+            return ""
+
+    def _generate_raw_ollama(self, prompt: str, max_tokens: int = 512) -> str:
+        url = f"{self.ollama_base_url}/api/generate"
+        payload = {
+            "model": self.ollama_model,
             "prompt": prompt,
             "stream": False,
             "options": {
@@ -93,24 +200,12 @@ class LLMQuestionBackend:
             self.available = False
             return ""
 
-    # ----------- публичные методы генерации -----------
-
     def generate_questions(
-            self,
-            level: str,
-            qtype: str,
-            n: int = 1,
+        self,
+        level: str,
+        qtype: str,
+        n: int = 1,
     ) -> list[dict[str, Any]]:
-        """
-        Сгенерировать n вопросов указанного типа и уровня через Ollama.
-
-        Возвращает список словарей с ключами:
-        * text
-        * options
-        * correct_index
-        * topic
-        """
-        # Если бэкенд не доступен — сразу выходим
         if not self.available:
             return []
 
@@ -122,98 +217,94 @@ class LLMQuestionBackend:
 
         prompt = textwrap.dedent(
             f"""
-            You are an experienced ESL teacher.
-            Create {n} multiple-choice questions for a student with CEFR level {level}.
+            You are an experienced ESL teacher. Create {n} multiple-choice questions for a student with CEFR level {level}.
+
             Focus on {skill}.
 
-            For each question you MUST provide:
+            STRICT RULES:
+            - Return ONLY valid JSON: a list of objects.
+            - Each question must have:
+              - "text": Russian instruction + ONE English sentence/question with exactly one blank: ___
+              - "options": exactly 4 answer options
+              - "correct_index": index from 0 to 3
+              - "topic": short topic identifier in English
 
-            - "text": question text in Russian with English examples where needed
-            - "options": 4 answer options as a JSON array of strings
-            - "correct_index": index (0-3) of the correct option
-            - "topic": short topic identifier in English (like "articles", "present_simple")
+            IMPORTANT:
+            - NEVER write the correct answer in the question text.
+            - NEVER include hints in parentheses.
+            - NEVER include alternative forms in the text like "(work / works)".
+            - NEVER include translations of the correct answer in the text.
+            - NEVER repeat any option text inside the question text.
+            - The stem must contain a blank ___ instead of the missing word/phrase.
 
-            Return ONLY valid JSON: a list of objects, e.g.
+            BAD examples:
+            - "She (work / works) in a hospital."
+            - "I saw ___ interesting film yesterday. (an interesting film)"
+            - "___ many books on the table. (There are many books)"
 
+            GOOD examples:
+            - "Выберите правильный вариант. She ___ in a hospital."
+            - "Выберите правильный артикль. I saw ___ interesting film yesterday."
+            - "Выберите правильный вариант. ___ many books on the table."
+
+            Example output:
             [
               {{
-                "text": "[{level}][articles] Выберите правильный вариант.",
-                "options": ["a cat", "an cat", "the cat", "cat"],
-                "correct_index": 0,
-                "topic": "articles"
+                "text": "Выберите правильный вариант. She ___ in a hospital.",
+                "options": ["work", "works", "working", "is work"],
+                "correct_index": 1,
+                "topic": "present_simple"
               }}
             ]
 
-            No explanations, no comments, no Markdown.
-            Only pure JSON list.
+            No explanations, no comments, no Markdown. Only pure JSON list.
             """
         ).strip()
 
-        # ---- 1. Дёргаем Ollama ----
-        raw = self._generate_raw(prompt)
+        raw = self._generate_raw(prompt, max_tokens=max_tokens_for_batch(n))
         if not raw:
-            logger.error("LLM вернула пустой ответ при generate_questions (qtype=%s, level=%s)", qtype, level)
+            logger.error("LLM вернула пустой ответ при generate_questions (qtype={}, level={})", qtype, level)
             return []
 
-        # ---- 2. Вырезаем JSON массив из ответа ----
-        # иногда модель добавляет лишний текст до/после
         start = raw.find("[")
         end = raw.rfind("]")
         if start == -1 or end == -1 or end <= start:
-            logger.error("LLM ответ без JSON-массива (qtype=%s, level=%s): %r", qtype, level, raw[:2000])
+            logger.error("LLM ответ без JSON-массива (qtype={}, level={}): {!r}", qtype, level, raw[:2000])
             return []
 
-        json_text = raw[start: end + 1]
-
-        # ---- 3. Подчищаем типичные артефакты ----
-
-        # убираем ```json ... ``` если модель их добавила
+        json_text = raw[start:end + 1]
         json_text = re.sub(r"```(?:json)?", "", json_text, flags=re.IGNORECASE)
         json_text = json_text.replace("```", "")
-
-        # убираем возможные trailing commas перед ] или }
-        # [...,]  или {...,}
         json_text = re.sub(r",(\s*[}\]])", r"\1", json_text)
 
-        # иногда модель ставит комментарии // ... в JSON — вырезаем строки с ними
         lines = []
         for line in json_text.splitlines():
-            # обрежем всё после //, если оно не внутри строки — это уже сложно детектить,
-            # поэтому делаем грубо: просто убираем // и дальше до конца строки.
             if "//" in line:
                 line = line.split("//", 1)[0]
             lines.append(line)
         json_text = "\n".join(lines).strip()
 
-        # ---- 4. Парсим JSON ----
         try:
             data = json.loads(json_text)
         except json.JSONDecodeError as e:
-            logger.error(
-                "Не удалось распарсить JSON от LLM: %s\nСырой JSON (обрезано): %r",
-                e,
-                json_text[:2000],
-            )
+            logger.error("Не удалось распарсить JSON от LLM: {}\nСырой JSON (обрезано): {!r}", e, json_text[:2000])
             return []
 
         if isinstance(data, dict):
-            # На всякий случай, если модель вернула один объект вместо списка
             data = [data]
 
         if not isinstance(data, list):
-            logger.error("LLM JSON не является списком объектов: %r", type(data))
+            logger.error("LLM JSON не является списком объектов: {!r}", type(data))
             return []
 
-        # ---- 5. Нормализуем структуру вопросов ----
         result: list[dict[str, Any]] = []
         for item in data:
             if not isinstance(item, dict):
                 continue
 
             text_val = str(item.get("text", "")).strip()
-            options_val = [str(o) for o in item.get("options", [])][:4]
-
-            if len(options_val) < 2:
+            options_val = [str(o).strip() for o in item.get("options", [])][:4]
+            if len(options_val) != 4:
                 continue
 
             try:
@@ -221,32 +312,42 @@ class LLMQuestionBackend:
             except (TypeError, ValueError):
                 correct_index_val = 0
 
+            correct_index_val = max(0, min(correct_index_val, len(options_val) - 1))
             topic_val = str(item.get("topic", "general")).strip() or "general"
+
+            if qtype in {"grammar", "vocabulary"}:
+                text_val = self._cleanup_stem(text_val)
+
+                if "___" not in text_val:
+                    logger.warning("LLM question skipped: no blank in text: {}", text_val)
+                    continue
+
+                if self._question_leaks_answer(text_val, options_val, correct_index_val):
+                    logger.warning(
+                        "LLM question skipped: answer leaked into stem. text={}, options={}, correct_index={}",
+                        text_val,
+                        options_val,
+                        correct_index_val,
+                    )
+                    continue
 
             result.append(
                 {
                     "text": text_val,
                     "options": options_val,
-                    "correct_index": max(0, min(correct_index_val, len(options_val) - 1)),
+                    "correct_index": correct_index_val,
                     "topic": topic_val,
                 }
             )
-
         return result[:n]
 
     def generate_pronunciation_phrase(self, level: str) -> str | None:
-        """
-        Сгенерировать одно слово или короткую фразу для произношения.
-        """
         if not self.available:
             return None
 
         prompt = textwrap.dedent(
             f"""
-            You are an English teacher.
-
-            Generate ONE short natural English phrase or ONE word suitable
-            for a student with CEFR level {level}.
+            You are an English teacher. Generate ONE short natural English phrase or ONE word suitable for a student with CEFR level {level}.
 
             Requirements:
             - 1–8 words
@@ -260,7 +361,6 @@ class LLMQuestionBackend:
         if not raw:
             return None
 
-        # берём последнюю непустую строку как фразу
         lines = [l.strip() for l in raw.splitlines() if l.strip()]
         if not lines:
             return None
@@ -272,33 +372,19 @@ class LLMQuestionBackend:
         return phrase
 
     def generate_listening_mcq(self, level: str) -> tuple[str, list[str], int] | None:
-        """
-        Генерирует одно предложение (6–12 слов) и 4 варианта,
-        где ровно один вариант — точная копия предложения.
-
-        Формат:
-        Sentence: <sentence>
-        A) ...
-        B) ...
-        C) ...
-        D) ...
-        Correct: <letter>
-        """
         if not self.available:
             return None
 
         prompt = textwrap.dedent(
             f"""
-            You are an English teacher.
-            Create ONE listening comprehension question for a CEFR {level} student.
+            You are an English teacher. Create ONE listening comprehension question for a CEFR {level} student.
 
             Requirements:
-            - First line: "Sentence: <English sentence of 6-12 words>"
+            - First line: "Sentence: "
             - Next 4 lines: options labeled A), B), C), D)
             - Exactly ONE option must be EXACTLY the same as the Sentence line text.
-            - Other 3 options must be similar but slightly different
-              (word order, small changes in time, place, details, etc.).
-            - Last line: "Correct: <letter of correct option>"
+            - Other 3 options must be similar but slightly different.
+            - Last line: "Correct: "
 
             Example:
             Sentence: I like to read books in the evening.
@@ -327,6 +413,7 @@ class LLMQuestionBackend:
         sentence = sentence_match.group(1).strip()
         options = [o.strip() for o in options_matches]
         letter = correct_match.group(1).upper()
+
         letter_to_index = {"A": 0, "B": 1, "C": 2, "D": 3}
         correct_index = letter_to_index.get(letter, 0)
 

@@ -89,18 +89,47 @@ async def _send_quick_question(message: Message, question: Question):
 @quick_router.message(QuickQuestionStates.CHOOSING_TYPE, F.text.in_(QUICK_TYPES.keys()))
 async def quick_question_generate(message: Message, state: FSMContext, user):
     qtype = QUICK_TYPES[message.text]
-    await tg_retry(message.answer,f"Генерирую быстрый вопрос типа: {message.text}")
+
+    status_msg = await tg_retry(
+        message.answer,
+        f"Подбираю быстрый вопрос типа: {message.text}"
+    )
+
+    async def notify_generation() -> None:
+        try:
+            await status_msg.edit_text(
+                "⏳ Генерирую новый вопрос, это может занять несколько секунд..."
+            )
+        except Exception:
+            pass
 
     async with async_session_maker() as session:
         service = QuickQuestionService(session, QuestionGenerator(use_llm=True))
-        question = await service.get_or_generate_question(user.id, user.level, qtype)
+        question = await service.get_or_generate_question(
+            user_id=user.id,
+            level=user.level,
+            qtype=qtype,
+            on_generation_start=notify_generation,
+        )
+
+    if not question:
+        try:
+            await status_msg.edit_text("Не удалось получить вопрос. Попробуйте позже.")
+        except Exception:
+            await tg_retry(message.answer, "Не удалось получить вопрос. Попробуйте позже.")
+        await state.clear()
+        return
+
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
 
     # сохраняем тип и id текущего вопроса
     await state.update_data(qtype=qtype, current_question_id=question.id)
 
     # --- ПРОИЗНОШЕНИЕ ---
     if qtype == "speaking":
-        # Вопрос на произношение
         await message.answer(
             question.payload["text"],
             reply_markup=lesson_in_progress_kb(),
@@ -184,21 +213,50 @@ async def handle_quick_answer(callback: CallbackQuery, state: FSMContext, user):
 @quick_router.message(QuickQuestionStates.AFTER_ANSWER, F.text == "Ещё вопрос")
 async def quick_question_more(message: Message, state: FSMContext, user):
     data = await state.get_data()
-    qtype = data.get("qtype")  # должен быть сохранён при выборе категории
+    qtype = data.get("qtype")
 
     if not qtype:
-        await tg_retry(message.answer,"Тип вопроса не найден. Пожалуйста, выберите категорию заново из меню.")
+        await tg_retry(
+            message.answer,
+            "Тип вопроса не найден. Пожалуйста, выберите категорию заново из меню."
+        )
         await state.clear()
         return
+
+    status_msg = await tg_retry(
+        message.answer,
+        "Подбираю следующий вопрос..."
+    )
+
+    async def notify_generation() -> None:
+        try:
+            await status_msg.edit_text(
+                "⏳ Генерирую новый вопрос, это может занять несколько секунд..."
+            )
+        except Exception:
+            pass
 
     async with async_session_maker() as session:
         service = QuickQuestionService(session, QuestionGenerator(use_llm=True))
-        question = await service.get_or_generate_question(user.id, user.level, qtype)
+        question = await service.get_or_generate_question(
+            user_id=user.id,
+            level=user.level,
+            qtype=qtype,
+            on_generation_start=notify_generation,
+        )
 
     if not question:
-        await tg_retry(message.answer,"Не удалось сгенерировать новый вопрос. Попробуйте позже.")
+        try:
+            await status_msg.edit_text("Не удалось сгенерировать новый вопрос. Попробуйте позже.")
+        except Exception:
+            await tg_retry(message.answer, "Не удалось сгенерировать новый вопрос. Попробуйте позже.")
         await state.clear()
         return
+
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
 
     # сохраняем новый текущий вопрос
     await state.update_data(current_question_id=question.id)

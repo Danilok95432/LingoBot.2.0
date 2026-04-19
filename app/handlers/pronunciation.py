@@ -3,6 +3,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 from aiogram.enums import ChatAction
 from loguru import logger
+from app.db.repositories import LessonRepository
+from app.keyboards import next_question_kb, main_menu_kb
+from app.states import LessonStates
 
 from app.db.session import async_session_maker
 from app.db.models import UserAnswer
@@ -137,13 +140,68 @@ async def handle_voice(message: Message, state: FSMContext, user):
                 text += "\n" + "\n".join(f"- {t}" for t in extra_tips)
 
         question_id = data.get("current_question_id")
+        lesson_id = data.get("lesson_id")
+
         if question_id is not None:
             try:
                 async with async_session_maker() as session:
+                    lesson_repo = LessonRepository(session)
+
+                    lesson = None
+                    if lesson_id is not None:
+                        lesson = await lesson_repo.get_session(int(lesson_id))
+
+                    # Если это ответ внутри урока — сохраняем его в lesson session
+                    if lesson is not None and lesson.state == "in_progress":
+                        ua = UserAnswer(
+                            user_id=user.id,
+                            question_id=int(question_id),
+                            session_id=lesson.id,
+                            is_correct=bool(passed),
+                            user_answer=recognized_text or expected,
+                            time_spent_sec=None,
+                            attempts=1,
+                            emotion_score=float(emo_score) if emo_score is not None else 0.0,
+                        )
+                        session.add(ua)
+
+                        if passed:
+                            lesson.correct_count += 1
+
+                        lesson.current_index += 1
+
+                        is_finished = lesson.current_index >= lesson.total_questions
+                        if is_finished:
+                            lesson.state = "completed"
+
+                        await session.commit()
+                        await session.refresh(lesson)
+
+                        if is_finished:
+                            final_text = (
+                                f"{text}\n\n"
+                                f"Урок завершён! Правильных ответов: "
+                                f"{lesson.correct_count}/{lesson.total_questions}"
+                            )
+                            await wait_msg.edit_text(final_text)
+                            await message.answer("Возвращаемся в меню.", reply_markup=main_menu_kb())
+                            await state.clear()
+                            return
+
+                        await wait_msg.edit_text(text)
+                        await message.answer(
+                            "Ответ сохранён. Нажмите, чтобы перейти к следующему вопросу.",
+                            reply_markup=next_question_kb(),
+                        )
+                        await state.set_state(LessonStates.WAITING_NEXT)
+                        await state.update_data(lesson_id=lesson.id)
+                        return
+
+                    # Иначе это обычный quick speaking question
                     ua = UserAnswer(
                         user_id=user.id,
                         question_id=int(question_id),
-                        session_id=None,  # для быстрых вопросов по произношению
+                        session_id=None,
                         is_correct=bool(passed),
                         user_answer=recognized_text or expected,
                         time_spent_sec=None,
@@ -152,6 +210,7 @@ async def handle_voice(message: Message, state: FSMContext, user):
                     )
                     session.add(ua)
                     await session.commit()
+
             except Exception as db_exc:
                 logger.error("Не удалось сохранить UserAnswer для произношения: {}", db_exc)
 
